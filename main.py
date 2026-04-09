@@ -1,14 +1,24 @@
+import logging
 import os
 import re
 import smtplib
-from email.mime.text import MIMEText
 from email.header import Header
+from email.mime.text import MIMEText
 from typing import Any, Dict, Optional
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 
-app = FastAPI(title="IPK Telegram Lead Bot v5")
+app = FastAPI(title="IPK Telegram Lead Bot v5.1")
+
+# =========================
+# Логирование
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # =========================
 # Настройки
@@ -16,15 +26,17 @@ app = FastAPI(title="IPK Telegram Lead Bot v5")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
-# Почта для отправки заявок
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.mail.ru").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465").strip())
-SMTP_LOGIN = os.getenv("SMTP_LOGIN", "").strip()          # например: ak.01@bk.ru
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()    # спецпароль для внешнего приложения
+SMTP_LOGIN = os.getenv("SMTP_LOGIN", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
 LEADS_EMAIL = os.getenv("LEADS_EMAIL", "ak.01@bk.ru").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
+
+if not WEBHOOK_SECRET:
+    raise RuntimeError("Не задан WEBHOOK_SECRET")
 
 if not SMTP_LOGIN:
     raise RuntimeError("Не задан SMTP_LOGIN")
@@ -223,12 +235,22 @@ def send_email_lead(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> 
     msg["To"] = LEADS_EMAIL
 
     try:
+        logger.info("Пробуем отправить письмо: to=%s | subject=%s", LEADS_EMAIL, subject)
+
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
             server.login(SMTP_LOGIN, SMTP_PASSWORD)
             server.sendmail(SMTP_LOGIN, [LEADS_EMAIL], msg.as_string())
+
+        logger.info("Письмо успешно отправлено: to=%s", LEADS_EMAIL)
         return True
-    except Exception:
+
+    except Exception as exc:
+        logger.exception("Ошибка отправки письма: %s", exc)
         return False
+
+
+def send_email_lead_background(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> None:
+    send_email_lead(user_data, message_data)
 
 
 def start_application(chat_id: int, user_id: int) -> None:
@@ -240,7 +262,7 @@ def start_application(chat_id: int, user_id: int) -> None:
     )
 
 
-def process_user_message(message_data: Dict[str, Any]) -> None:
+def process_user_message(message_data: Dict[str, Any], background_tasks: BackgroundTasks) -> None:
     chat_id = message_data["chat_id"]
     user_id = message_data["user_id"]
     text = message_data["text"].strip()
@@ -315,20 +337,29 @@ def process_user_message(message_data: Dict[str, Any]) -> None:
         else:
             user_data["comment"] = text
 
-        email_sent = send_email_lead(user_data, message_data)
+        lead_data = {
+            "service_key": user_data.get("service_key"),
+            "service_name": user_data.get("service_name"),
+            "name": user_data.get("name"),
+            "phone": user_data.get("phone"),
+            "comment": user_data.get("comment"),
+        }
 
-        if email_sent:
-            send_message(
-                chat_id,
-                "Спасибо. Заявка принята. Мы свяжемся с вами.",
-                reply_markup=get_main_keyboard(),
-            )
-        else:
-            send_message(
-                chat_id,
-                "Спасибо. Заявка сохранена. Мы свяжемся с вами.",
-                reply_markup=get_main_keyboard(),
-            )
+        lead_message_data = {
+            "chat_id": message_data.get("chat_id"),
+            "user_id": message_data.get("user_id"),
+            "username": message_data.get("username"),
+            "first_name": message_data.get("first_name"),
+            "last_name": message_data.get("last_name"),
+        }
+
+        send_message(
+            chat_id,
+            "Спасибо. Заявка принята. Мы свяжемся с вами.",
+            reply_markup=get_main_keyboard(),
+        )
+
+        background_tasks.add_task(send_email_lead_background, lead_data, lead_message_data)
 
         reset_user(user_id)
         return
@@ -349,7 +380,7 @@ async def healthcheck():
 
 
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         update = await request.json()
     except Exception as exc:
@@ -360,20 +391,18 @@ async def telegram_webhook(request: Request):
         return {"ok": True, "ignored": True}
 
     try:
-        process_user_message(message_data)
+        process_user_message(message_data, background_tasks)
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Telegram API error: {exc}") from exc
     except Exception as exc:
+        logger.exception("Внутренняя ошибка webhook: %s", exc)
         raise HTTPException(status_code=500, detail=f"Internal error: {exc}") from exc
 
     return {"ok": True}
 
 
 @app.post("/webhook/{secret}")
-async def telegram_webhook_secret(secret: str, request: Request):
-    if not WEBHOOK_SECRET:
-        raise HTTPException(status_code=404, detail="Secret webhook route is disabled")
-
+async def telegram_webhook_secret(secret: str, request: Request, background_tasks: BackgroundTasks):
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -387,10 +416,11 @@ async def telegram_webhook_secret(secret: str, request: Request):
         return {"ok": True, "ignored": True}
 
     try:
-        process_user_message(message_data)
+        process_user_message(message_data, background_tasks)
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Telegram API error: {exc}") from exc
     except Exception as exc:
+        logger.exception("Внутренняя ошибка secret webhook: %s", exc)
         raise HTTPException(status_code=500, detail=f"Internal error: {exc}") from exc
 
     return {"ok": True}
