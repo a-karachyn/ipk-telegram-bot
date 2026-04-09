@@ -1,10 +1,13 @@
+import json
 import logging
 import os
 import re
 from typing import Any, Dict, Optional
 
+import redis
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from pydantic import BaseModel
 
 app = FastAPI(title="IPK Telegram Lead Bot v7")
 
@@ -41,9 +44,26 @@ except ValueError as exc:
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # =========================
-# In-memory state
+# Redis
 # =========================
-users: Dict[int, Dict[str, Any]] = {}
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+r = redis.from_url(REDIS_URL, decode_responses=True)
+
+
+def get_user(user_id: int) -> Optional[Dict[str, Any]]:
+    raw = r.get(f"user:{user_id}")
+    if raw is None:
+        return None
+    return json.loads(raw)
+
+
+def set_user(user_id: int, data: Dict[str, Any]) -> None:
+    r.setex(f"user:{user_id}", 3600, json.dumps(data))
+
+
+def delete_user(user_id: int) -> None:
+    r.delete(f"user:{user_id}")
+
 
 services = {
     "1": "Разработка СТУ",
@@ -128,18 +148,18 @@ def get_services_text() -> str:
 
 
 def reset_user(user_id: int) -> None:
-    users.pop(user_id, None)
+    delete_user(user_id)
 
 
 def init_user(user_id: int) -> None:
-    users[user_id] = {
+    set_user(user_id, {
         "state": STATE_CHOOSE_SERVICE,
         "service_key": None,
         "service_name": None,
         "name": None,
         "phone": None,
         "comment": None,
-    }
+    })
 
 
 def send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
@@ -244,32 +264,54 @@ def get_service_visual_label(service_key: Optional[str]) -> str:
     return service_labels.get(service_key, "⚪ Заявка")
 
 
-def format_lead_message(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> str:
+def format_lead_message(
+    user_data: Dict[str, Any],
+    message_data: Dict[str, Any],
+    source: str = "bot",
+) -> str:
     comment = user_data.get("comment") or "—"
     client_label = get_telegram_user_label(message_data)
     service_key = user_data.get("service_key")
     visual_label = get_service_visual_label(service_key)
 
+    if source == "site":
+        source_label = "🌐 Сайт"
+    else:
+        source_label = "💬 Telegram бот"
+
     header = "Новая заявка с бота"
     if is_urgent(user_data.get("comment")):
         header = "🔥 СРОЧНАЯ ЗАЯВКА"
 
-    return (
-        f"{header}\n\n"
-        f"{visual_label}\n"
-        f"Услуга: {user_data.get('service_name', '—')}\n"
-        f"Имя: {user_data.get('name', '—')}\n"
-        f"Телефон: {user_data.get('phone', '—')}\n"
-        f"Комментарий: {comment}\n\n"
-        f"Клиент в Telegram: {client_label}\n"
-        f"Chat ID клиента: {message_data.get('chat_id')}\n"
-        f"User ID клиента: {message_data.get('user_id')}"
-    )
+    lines = [
+        f"{header}",
+        f"{source_label}",
+        "",
+        f"{visual_label}",
+        f"Услуга: {user_data.get('service_name', '—')}",
+        f"Имя: {user_data.get('name', '—')}",
+        f"Телефон: {user_data.get('phone', '—')}",
+        f"Комментарий: {comment}",
+    ]
+
+    if message_data.get("user_id"):
+        lines += [
+            "",
+            f"Клиент в Telegram: {client_label}",
+            f"Chat ID клиента: {message_data.get('chat_id')}",
+            f"User ID клиента: {message_data.get('user_id')}",
+        ]
+
+    return "\n".join(lines)
 
 
-def send_lead_to_manager(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> bool:
+def send_lead_to_manager(
+    user_data: Dict[str, Any],
+    message_data: Dict[str, Any],
+    source: str = "bot",
+) -> bool:
     try:
-        text = format_lead_message(user_data, message_data)
+        text = format_lead_message(user_data, message_data, source=source)
         manager_keyboard = get_manager_inline_keyboard(message_data)
 
         logger.info("Пробуем отправить заявку в Telegram manager_chat_id=%s", MANAGER_CHAT_ID)
@@ -282,8 +324,12 @@ def send_lead_to_manager(user_data: Dict[str, Any], message_data: Dict[str, Any]
         return False
 
 
-def send_lead_to_manager_background(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> None:
-    send_lead_to_manager(user_data, message_data)
+def send_lead_to_manager_background(
+    user_data: Dict[str, Any],
+    message_data: Dict[str, Any],
+    source: str = "bot",
+) -> None:
+    send_lead_to_manager(user_data, message_data, source=source)
 
 
 def start_application(chat_id: int, user_id: int) -> None:
@@ -304,7 +350,9 @@ def process_user_message(message_data: Dict[str, Any], background_tasks: Backgro
         start_application(chat_id, user_id)
         return
 
-    if user_id not in users:
+    user_data = get_user(user_id)
+
+    if user_data is None:
         send_message(
             chat_id,
             'Чтобы оставить заявку, нажмите кнопку "заявка".',
@@ -312,7 +360,6 @@ def process_user_message(message_data: Dict[str, Any], background_tasks: Backgro
         )
         return
 
-    user_data = users[user_id]
     state = user_data["state"]
 
     if state == STATE_CHOOSE_SERVICE:
@@ -327,6 +374,7 @@ def process_user_message(message_data: Dict[str, Any], background_tasks: Backgro
         user_data["service_key"] = text
         user_data["service_name"] = services[text]
         user_data["state"] = STATE_NAME
+        set_user(user_id, user_data)
 
         send_message(chat_id, "Введите имя")
         return
@@ -338,6 +386,7 @@ def process_user_message(message_data: Dict[str, Any], background_tasks: Backgro
 
         user_data["name"] = text
         user_data["state"] = STATE_PHONE
+        set_user(user_id, user_data)
 
         send_message(chat_id, "Введите телефон")
         return
@@ -356,6 +405,7 @@ def process_user_message(message_data: Dict[str, Any], background_tasks: Backgro
 
         user_data["phone"] = normalize_phone(text)
         user_data["state"] = STATE_COMMENT
+        set_user(user_id, user_data)
 
         send_message(
             chat_id,
@@ -392,7 +442,9 @@ def process_user_message(message_data: Dict[str, Any], background_tasks: Backgro
             reply_markup=get_main_keyboard(),
         )
 
-        background_tasks.add_task(send_lead_to_manager_background, lead_data, lead_message_data)
+        background_tasks.add_task(
+            send_lead_to_manager_background, lead_data, lead_message_data, "bot"
+        )
 
         reset_user(user_id)
         return
@@ -405,11 +457,59 @@ def process_user_message(message_data: Dict[str, Any], background_tasks: Backgro
     )
 
 # =========================
+# Модели для /site-lead
+# =========================
+class SiteLeadRequest(BaseModel):
+    name: str
+    phone: str
+    service: str
+    message: str = ""
+
+# =========================
 # HTTP
 # =========================
 @app.get("/")
 async def healthcheck():
     return {"status": "ok"}
+
+
+@app.post("/site-lead")
+async def site_lead(request: Request, background_tasks: BackgroundTasks):
+    secret = request.headers.get("X-Secret-Key", "")
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
+
+    try:
+        payload = SiteLeadRequest(**body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Validation error: {exc}") from exc
+
+    user_data = {
+        "service_key": None,
+        "service_name": payload.service,
+        "name": payload.name,
+        "phone": payload.phone,
+        "comment": payload.message or None,
+    }
+
+    message_data: Dict[str, Any] = {
+        "chat_id": None,
+        "user_id": None,
+        "username": None,
+        "first_name": None,
+        "last_name": None,
+    }
+
+    background_tasks.add_task(
+        send_lead_to_manager_background, user_data, message_data, "site"
+    )
+
+    return {"ok": True}
 
 
 @app.post("/webhook")
