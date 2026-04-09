@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 
-app = FastAPI(title="IPK Telegram Lead Bot v6")
+app = FastAPI(title="IPK Telegram Lead Bot v7")
 
 # =========================
 # Логирование
@@ -52,6 +52,13 @@ services = {
     "4": "Проектирование систем КСОБ",
 }
 
+service_labels = {
+    "1": "🟢 СТУ",
+    "2": "🔵 Пожарные риски",
+    "3": "🟠 СПС / СОУЭ / Пожаротушение",
+    "4": "🟣 КСОБ",
+}
+
 STATE_CHOOSE_SERVICE = "choose_service"
 STATE_NAME = "name"
 STATE_PHONE = "phone"
@@ -88,6 +95,23 @@ def get_comment_keyboard() -> Dict[str, Any]:
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
+    }
+
+
+def get_manager_inline_keyboard(message_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    username = message_data.get("username")
+    if not username:
+        return None
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Написать клиенту",
+                    "url": f"https://t.me/{username}",
+                }
+            ]
+        ]
     }
 
 # =========================
@@ -198,12 +222,41 @@ def is_valid_phone(phone: str) -> bool:
     return len(digits_only) >= 10
 
 
+def is_urgent(comment: Optional[str]) -> bool:
+    if not comment:
+        return False
+
+    text = comment.lower()
+    urgent_markers = [
+        "срочно",
+        "urgent",
+        "asap",
+        "как можно скорее",
+        "сегодня",
+        "немедленно",
+    ]
+    return any(marker in text for marker in urgent_markers)
+
+
+def get_service_visual_label(service_key: Optional[str]) -> str:
+    if not service_key:
+        return "⚪ Заявка"
+    return service_labels.get(service_key, "⚪ Заявка")
+
+
 def format_lead_message(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> str:
     comment = user_data.get("comment") or "—"
     client_label = get_telegram_user_label(message_data)
+    service_key = user_data.get("service_key")
+    visual_label = get_service_visual_label(service_key)
+
+    header = "Новая заявка с бота"
+    if is_urgent(user_data.get("comment")):
+        header = "🔥 СРОЧНАЯ ЗАЯВКА"
 
     return (
-        "Новая заявка с бота\n\n"
+        f"{header}\n\n"
+        f"{visual_label}\n"
         f"Услуга: {user_data.get('service_name', '—')}\n"
         f"Имя: {user_data.get('name', '—')}\n"
         f"Телефон: {user_data.get('phone', '—')}\n"
@@ -217,10 +270,13 @@ def format_lead_message(user_data: Dict[str, Any], message_data: Dict[str, Any])
 def send_lead_to_manager(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> bool:
     try:
         text = format_lead_message(user_data, message_data)
+        manager_keyboard = get_manager_inline_keyboard(message_data)
+
         logger.info("Пробуем отправить заявку в Telegram manager_chat_id=%s", MANAGER_CHAT_ID)
-        send_message(MANAGER_CHAT_ID, text)
+        send_message(MANAGER_CHAT_ID, text, reply_markup=manager_keyboard)
         logger.info("Заявка успешно отправлена в Telegram")
         return True
+
     except Exception as exc:
         logger.exception("Ошибка отправки заявки в Telegram: %s", exc)
         return False
