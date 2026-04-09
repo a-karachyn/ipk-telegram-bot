@@ -1,15 +1,12 @@
 import logging
 import os
 import re
-import smtplib
-from email.header import Header
-from email.mime.text import MIMEText
 from typing import Any, Dict, Optional
 
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 
-app = FastAPI(title="IPK Telegram Lead Bot v5.1")
+app = FastAPI(title="IPK Telegram Lead Bot v6")
 
 # =========================
 # Логирование
@@ -25,12 +22,7 @@ logger = logging.getLogger(__name__)
 # =========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.mail.ru").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465").strip())
-SMTP_LOGIN = os.getenv("SMTP_LOGIN", "").strip()
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
-LEADS_EMAIL = os.getenv("LEADS_EMAIL", "ak.01@bk.ru").strip()
+MANAGER_CHAT_ID_RAW = os.getenv("MANAGER_CHAT_ID", "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
@@ -38,11 +30,13 @@ if not BOT_TOKEN:
 if not WEBHOOK_SECRET:
     raise RuntimeError("Не задан WEBHOOK_SECRET")
 
-if not SMTP_LOGIN:
-    raise RuntimeError("Не задан SMTP_LOGIN")
+if not MANAGER_CHAT_ID_RAW:
+    raise RuntimeError("Не задан MANAGER_CHAT_ID")
 
-if not SMTP_PASSWORD:
-    raise RuntimeError("Не задан SMTP_PASSWORD")
+try:
+    MANAGER_CHAT_ID = int(MANAGER_CHAT_ID_RAW)
+except ValueError as exc:
+    raise RuntimeError("MANAGER_CHAT_ID должен быть числом") from exc
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -204,53 +198,36 @@ def is_valid_phone(phone: str) -> bool:
     return len(digits_only) >= 10
 
 
-def format_email_subject(user_data: Dict[str, Any]) -> str:
-    service_name = user_data.get("service_name", "Заявка")
-    return f"Новая заявка — {service_name}"
-
-
-def format_email_body(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> str:
+def format_lead_message(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> str:
     comment = user_data.get("comment") or "—"
     client_label = get_telegram_user_label(message_data)
 
     return (
-        "Новая заявка с Telegram-бота\n\n"
+        "Новая заявка с бота\n\n"
         f"Услуга: {user_data.get('service_name', '—')}\n"
         f"Имя: {user_data.get('name', '—')}\n"
         f"Телефон: {user_data.get('phone', '—')}\n"
         f"Комментарий: {comment}\n\n"
         f"Клиент в Telegram: {client_label}\n"
-        f"Chat ID: {message_data.get('chat_id')}\n"
-        f"User ID: {message_data.get('user_id')}"
+        f"Chat ID клиента: {message_data.get('chat_id')}\n"
+        f"User ID клиента: {message_data.get('user_id')}"
     )
 
 
-def send_email_lead(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> bool:
-    subject = format_email_subject(user_data)
-    body = format_email_body(user_data, message_data)
-
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = Header(subject, "utf-8")
-    msg["From"] = SMTP_LOGIN
-    msg["To"] = LEADS_EMAIL
-
+def send_lead_to_manager(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> bool:
     try:
-        logger.info("Пробуем отправить письмо: to=%s | subject=%s", LEADS_EMAIL, subject)
-
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-            server.login(SMTP_LOGIN, SMTP_PASSWORD)
-            server.sendmail(SMTP_LOGIN, [LEADS_EMAIL], msg.as_string())
-
-        logger.info("Письмо успешно отправлено: to=%s", LEADS_EMAIL)
+        text = format_lead_message(user_data, message_data)
+        logger.info("Пробуем отправить заявку в Telegram manager_chat_id=%s", MANAGER_CHAT_ID)
+        send_message(MANAGER_CHAT_ID, text)
+        logger.info("Заявка успешно отправлена в Telegram")
         return True
-
     except Exception as exc:
-        logger.exception("Ошибка отправки письма: %s", exc)
+        logger.exception("Ошибка отправки заявки в Telegram: %s", exc)
         return False
 
 
-def send_email_lead_background(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> None:
-    send_email_lead(user_data, message_data)
+def send_lead_to_manager_background(user_data: Dict[str, Any], message_data: Dict[str, Any]) -> None:
+    send_lead_to_manager(user_data, message_data)
 
 
 def start_application(chat_id: int, user_id: int) -> None:
@@ -359,7 +336,7 @@ def process_user_message(message_data: Dict[str, Any], background_tasks: Backgro
             reply_markup=get_main_keyboard(),
         )
 
-        background_tasks.add_task(send_email_lead_background, lead_data, lead_message_data)
+        background_tasks.add_task(send_lead_to_manager_background, lead_data, lead_message_data)
 
         reset_user(user_id)
         return
