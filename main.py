@@ -11,6 +11,24 @@ from pydantic import BaseModel
 
 app = FastAPI(title="IPK Telegram Lead Bot v7")
 
+
+@app.on_event("startup")
+async def register_webhook():
+    webhook_url = os.getenv("WEBHOOK_URL", "https://ipk-telegram-bot.onrender.com/webhook")
+    try:
+        resp = requests.post(
+            f"{TELEGRAM_API_URL}/setWebhook",
+            json={"url": webhook_url},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("ok"):
+            logger.info(f"✅ Webhook зарегистрирован: {webhook_url}")
+        else:
+            logger.error(f"❌ Ошибка регистрации webhook: {data}")
+    except Exception as e:
+        logger.error(f"❌ Не удалось зарегистрировать webhook: {e}")
+
 # =========================
 # Логирование
 # =========================
